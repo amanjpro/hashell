@@ -1,3 +1,4 @@
+module REPL(shell) where
 import System.Posix.Process
 import System.Posix.Types
 import System.Directory
