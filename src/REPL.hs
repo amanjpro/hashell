@@ -15,6 +15,7 @@ import System.IO
 import Text.Parsec
 import Text.Parsec.String
 import Text.Parsec.Token
+import Text.Parsec.Expr
 import Control.Applicative ((<$>), (<*))
 
 -- Util modules
@@ -30,11 +31,16 @@ type CloseFds = MVar [Fd]
 
 data Action     = Read | Write | Append deriving (Show, Eq)
 data Joint      = Pipe | And deriving (Show, Eq)
-data Cmd        = SimpleCmd String [String] |
-                  RedirectCmd Cmd Action String |
-                  CompoundCmd Cmd Joint Cmd |
+data Cmd        = FileName String |
+                  SimpleCmd String [String] |
+                  RedirectCmd Action Cmd Cmd |
+                  CompoundCmd Joint Cmd Cmd |
                   SubShell Cmd deriving (Show, Eq)
 newtype History = History {history :: [Cmd]}
+
+getFileName :: Cmd -> String
+getFileName (FileName name) = name
+getFileName _ = ""
 
 callSystem :: String -> [String] -> IO ()
 callSystem "exit" []    = exitSuccess
@@ -83,21 +89,24 @@ runCommand (SimpleCmd cmd args) closefds input          =
     wait childId
     handle <- fdToHandle stdoutread
     hGetContents handle
-runCommand (RedirectCmd cmd Read file) closefds input   = do
-  content <- readFile file
+runCommand (RedirectCmd Read cmd file) closefds input   = do
+  content <- readFile $ getFileName file
   runCommand cmd closefds content
-runCommand (RedirectCmd cmd Write file) closefds input  = do
+runCommand (RedirectCmd Write cmd file) closefds input  = do
   res <- runCommand cmd closefds input
-  writeFile file res
+  putStrLn $ show file
+  touchFile $ getFileName file
+  writeFile (getFileName file) res
   return ""
-runCommand (RedirectCmd cmd Append file) closefds input = do
+runCommand (RedirectCmd Append cmd file) closefds input = do
   res <- runCommand cmd closefds input
-  appendFile file res
+  touchFile $ getFileName file
+  appendFile (getFileName file) res
   return ""
-runCommand (CompoundCmd cmd1 And cmd2) closefds input   = do
+runCommand (CompoundCmd And cmd1 cmd2) closefds input   = do
   runCommand cmd1 closefds input
   runCommand cmd2 closefds ""
-runCommand (CompoundCmd cmd1 Pipe cmd2) closefds input = do
+runCommand (CompoundCmd Pipe cmd1 cmd2) closefds input = do
   res <- runCommand cmd1 closefds input
   runCommand cmd2 closefds res
 
@@ -130,9 +139,6 @@ removeCloseFDs closefds removethem =
         | fd == x = xs
         | otherwise = x : removefd xs fd
 
-
-exec :: String -> [String] -> [(String, String)] -> IO ProcessID
-exec cmd args env = forkProcess $ executeFile cmd True args $ Just env
 
 -- Shamelessly stolen from https://github.com/dblarons/haskell-shell/blob/master/Main.hs
 -- |Wait on a command that does not have file descriptors
@@ -174,19 +180,12 @@ processLine prefix = do
     PartialCmd  cmd -> processLine cmd
 
 getCmd :: IO Cmd
-getCmd = processLine ""
+getCmd = do
+  cmd <- processLine ""
+  putStrLn $ show cmd
+  return cmd
 
 -- parser
-
-toJoint :: String -> Joint
-toJoint "|"  = Pipe
-toJoint "&&" = And
-
-
-toAction :: String -> Action
-toAction "<"  = Read
-toAction ">"  = Write
-toAction ">>" = Append
 
 legalChar :: Parser Char
 legalChar = (oneOf ['.', '/', ':', '-']) <|> digit <|> letter
@@ -217,44 +216,15 @@ tokenParser = do
   spaces
   many1 legalChar <|> shellString
 
-jointParser :: Parser Joint
-jointParser = do
-  spaces
-  link <- pipe <|> andThen
-  return $ toJoint link
-  where pipe       = string "|"
-        andThen    = string "&&"
-
-actionParser :: Parser Cmd
-actionParser = do
-  command  <- cmdParser
-  spaces
-  link <- read <|> write <|> append
-  spaces
-  file <- tokenParser
-  let action = toAction link
-  return $ RedirectCmd command action file
-  where read   = string "<"
-        write  = string ">"
-        append = string ">>"
-
-
+factor :: Parser Cmd
+factor = subShellParser <|> simpleCmdParser
 
 simpleCmdParser :: Parser Cmd
 simpleCmdParser = do
   command  <- tokenParser
-  args     <- many tokenParser
+  spaces
+  args     <- sepBy tokenParser spaces
   return $ SimpleCmd command args
-
-compoundCmdParser :: Parser Cmd
-compoundCmdParser = do
-  fst  <- simpleCmdParser
-  link <- jointParser
-  snd  <- compoundCmdParser
-  return $ CompoundCmd fst link snd
-
-cmdParser :: Parser Cmd
-cmdParser = try compoundCmdParser <|> simpleCmdParser
 
 subShellParser :: Parser Cmd
 subShellParser = do
@@ -265,10 +235,23 @@ subShellParser = do
   char ')'
   return $ SubShell cmd
 
+toFileName :: Cmd -> Cmd
+toFileName (SimpleCmd cmd []) = FileName cmd
+toFileName cmd                = cmd
+
+entryParser' :: Parser Cmd
+entryParser' = buildExpressionParser table factor <?> "expression" where
+  table = [
+    [Infix (do { spaces; string "<"; spaces; return $ \c1 c2 -> RedirectCmd Read c1 $ toFileName c2}) AssocLeft,
+     Infix (do { spaces; string ">"; spaces; return $ \c1 c2 -> RedirectCmd Write c1 $ toFileName c2}) AssocLeft,
+     Infix (do { spaces; string ">>"; spaces; return $ \c1 c2 -> RedirectCmd Append c1 $ toFileName c2}) AssocLeft],
+    [Infix (do { spaces; string "&&"; spaces; return $ CompoundCmd And}) AssocLeft,
+     Infix (do { spaces; string "|"; spaces; return $ CompoundCmd Pipe}) AssocLeft]
+    ]
 
 entryParser :: Parser Cmd
 entryParser = do
-  res <- subShellParser <|> try actionParser <|> cmdParser
+  res <- entryParser'
   eof
   return res
 
